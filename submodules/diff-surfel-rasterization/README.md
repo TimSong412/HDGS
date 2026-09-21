@@ -1,4 +1,4 @@
-# Differential Surfel Rasterization
+# Sorted Cone-sample Surfel Rasterization
 
 This is the textured rasterization engine for the paper "HDGS: Textured 2D Gaussian Splatting for Enhanced Scene Rendering", build upon the rasterizer of 2DGS. If you can make use of it in your own research, please be so kind to cite us.
 
