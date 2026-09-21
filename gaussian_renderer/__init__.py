@@ -55,6 +55,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
+    # texture = torch.sigmoid(pc.texture_buffer)
+    texture = pc.texture_buffer
+    if hasattr(pipe, "render_base") and pipe.render_base:
+        index = pc.texture_index.clone() * -1 - 1
+    else:
+        index = pc.texture_index
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -99,6 +105,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         means2D = means2D,
         shs = shs,
         colors_precomp = colors_precomp,
+        texture_buffer=texture,
+        texture_index=index,
         opacities = opacity,
         scales = scales,
         rotations = rotations,

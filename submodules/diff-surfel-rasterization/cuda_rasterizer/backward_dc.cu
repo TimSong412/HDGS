@@ -15,6 +15,99 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
+#ifdef BILINEAR
+
+__device__ void tex2D(float3* dL_dtex, int width, int height, float u, float v, float3 dL_drgb)
+{
+	u = (u + 1.0f) * 0.5f;
+	v = (v + 1.0f) * 0.5f;
+	// if (u < 0 || u > 1 || v < 0 || v > 1) printf("u, v: %f, %f, W, H: %d, %d\n", u, v, width, height); // TODO: may out bound
+	const float x = u * (width - 1);
+	const float y = v * (height - 1);
+	const int x0 = min(max((int)x, 0), width - 1);
+	const int y0 = min(max((int)y, 0), height - 1);
+	const int x1 = min(max((int)x + 1, 0), width - 1);
+	const int y1 = min(max((int)y + 1, 0), height - 1);
+	
+	if (x0 == x1 && y0 == y1)
+	{
+	 	atomicAdd(&(dL_dtex[y0 * width + x0].x), dL_drgb.x);
+		atomicAdd(&(dL_dtex[y0 * width + x0].y), dL_drgb.y);
+		atomicAdd(&(dL_dtex[y0 * width + x0].z), dL_drgb.z);
+	}
+	else if (x0 == x1)
+	{
+		const float t = y - y0;
+		// const float3 c0 = tex[y0 * width + x0];
+		// const float3 c1 = tex[y1 * width + x0];
+		// return (1 - t) * c0 + t * c1;
+		atomicAdd(&(dL_dtex[y0 * width + x0].x), (1 - t) * dL_drgb.x);
+		atomicAdd(&(dL_dtex[y0 * width + x0].y), (1 - t) * dL_drgb.y);
+		atomicAdd(&(dL_dtex[y0 * width + x0].z), (1 - t) * dL_drgb.z);
+		atomicAdd(&(dL_dtex[y1 * width + x0].x), t * dL_drgb.x);
+		atomicAdd(&(dL_dtex[y1 * width + x0].y), t * dL_drgb.y);
+		atomicAdd(&(dL_dtex[y1 * width + x0].z), t * dL_drgb.z);
+
+	}
+	else if (y0 == y1)
+	{
+		const float s = x - x0;
+		// const float3 c0 = tex[y0 * width + x0];
+		// const float3 c1 = tex[y0 * width + x1];
+		// return (1 - s) * c0 + s * c1;
+		atomicAdd(&(dL_dtex[y0 * width + x0].x), (1 - s) * dL_drgb.x);
+		atomicAdd(&(dL_dtex[y0 * width + x0].y), (1 - s) * dL_drgb.y);
+		atomicAdd(&(dL_dtex[y0 * width + x0].z), (1 - s) * dL_drgb.z);
+		atomicAdd(&(dL_dtex[y0 * width + x1].x), s * dL_drgb.x);
+		atomicAdd(&(dL_dtex[y0 * width + x1].y), s * dL_drgb.y);
+		atomicAdd(&(dL_dtex[y0 * width + x1].z), s * dL_drgb.z);
+
+	}
+	else
+	{
+		const float s0 = x - x0;
+		const float s1 = x1 - x;
+		const float t0 = y - y0;
+		const float t1 = y1 - y;
+		// const float3 c00 = tex[y0 * width + x0];
+		// const float3 c01 = tex[y0 * width + x1];
+		// const float3 c10 = tex[y1 * width + x0];
+		// const float3 c11 = tex[y1 * width + x1];
+
+		// return s1*t1*c00 + s0*t1*c01 + s1*t0*c10 + s0*t0*c11;
+		atomicAdd(&(dL_dtex[y0 * width + x0].x), s1 * t1 * dL_drgb.x);
+		atomicAdd(&(dL_dtex[y0 * width + x0].y), s1 * t1 * dL_drgb.y);
+		atomicAdd(&(dL_dtex[y0 * width + x0].z), s1 * t1 * dL_drgb.z);
+		atomicAdd(&(dL_dtex[y0 * width + x1].x), s0 * t1 * dL_drgb.x);
+		atomicAdd(&(dL_dtex[y0 * width + x1].y), s0 * t1 * dL_drgb.y);
+		atomicAdd(&(dL_dtex[y0 * width + x1].z), s0 * t1 * dL_drgb.z);
+		atomicAdd(&(dL_dtex[y1 * width + x0].x), s1 * t0 * dL_drgb.x);
+		atomicAdd(&(dL_dtex[y1 * width + x0].y), s1 * t0 * dL_drgb.y);
+		atomicAdd(&(dL_dtex[y1 * width + x0].z), s1 * t0 * dL_drgb.z);
+		atomicAdd(&(dL_dtex[y1 * width + x1].x), s0 * t0 * dL_drgb.x);
+		atomicAdd(&(dL_dtex[y1 * width + x1].y), s0 * t0 * dL_drgb.y);
+		atomicAdd(&(dL_dtex[y1 * width + x1].z), s0 * t0 * dL_drgb.z);
+		
+	}
+	
+	
+}
+
+#else
+__device__ void tex2D(float3* dL_dtex, int width, int height, float u, float v, float3 dL_drgb)
+{
+	// u, v are in [-1, 1]
+	u = (u + 1.0f) * 0.5f;
+	v = (v + 1.0f) * 0.5f;
+	int x = min(max(int(u * (width-1)), 0), width - 1);
+	int y = min(max(int(v * (height-1)), 0), height - 1);
+	int idx = y * width + x;
+	atomicAdd(&(dL_dtex[idx].x), dL_drgb.x);
+	atomicAdd(&(dL_dtex[idx].y), dL_drgb.y);
+	atomicAdd(&(dL_dtex[idx].z), dL_drgb.z);
+}
+#endif
+
 // Backward pass for conversion of spherical harmonics to RGB for
 // each Gaussian.
 __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs)
@@ -152,6 +245,7 @@ renderCUDA(
 	const float4* __restrict__ normal_opacity,
 	const float* __restrict__ transMats,
 	const float* __restrict__ colors,
+	const int3* __restrict__ texture_index,
 	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
@@ -164,7 +258,8 @@ renderCUDA(
 	float3* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+	float3* __restrict__ dL_dtex)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -294,6 +389,7 @@ renderCUDA(
 		const float3 Tv = {transMats[9 * global_id+3], transMats[9 * global_id+4], transMats[9 * global_id+5]};
 		const float3 Tw = {transMats[9 * global_id+6], transMats[9 * global_id+7], transMats[9 * global_id+8]};
 		const float4 nor_o = normal_opacity[global_id];
+		const int3 index = texture_index[global_id];
 
 		float3 k = pix.x * Tw - Tu;
 		float3 l = pix.y * Tw - Tv;
@@ -304,30 +400,30 @@ renderCUDA(
 		float2 d = {xy.x - pixf.x, xy.y - pixf.y};
 		float rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y); 
 
-		float3 k00 = (pixf.x - 0.25) * Tw - Tu;
-		float3 l00 = (pixf.y - 0.25) * Tw - Tv;
+		float3 k00 = (pixf.x - 0.5) * Tw - Tu;
+		float3 l00 = (pixf.y - 0.5) * Tw - Tv;
 		float3 p00 = cross(k00, l00);
 		float2 s00 = {p00.x / p00.z, p00.y / p00.z};
 		float rho00 = s00.x * s00.x + s00.y * s00.y;
 
 
-		float3 k10 = (pixf.x + 0.25) * Tw - Tu;
-		float3 l10 = (pixf.y - 0.25) * Tw - Tv;
+		float3 k10 = (pixf.x + 0.5) * Tw - Tu;
+		float3 l10 = (pixf.y - 0.5) * Tw - Tv;
 		float3 p10 = cross(k10, l10);
 		float2 s10 = {p10.x / p10.z, p10.y / p10.z};
 		float rho10 = s10.x * s10.x + s10.y * s10.y;
 
 
-		float3 k01 = (pixf.x - 0.25) * Tw - Tu;
-		float3 l01 = (pixf.y + 0.25) * Tw - Tv;
+		float3 k01 = (pixf.x - 0.5) * Tw - Tu;
+		float3 l01 = (pixf.y + 0.5) * Tw - Tv;
 		float3 p01 = cross(k01, l01);
 		float2 s01 = {p01.x / p01.z, p01.y / p01.z};
 		float rho01 = s01.x * s01.x + s01.y * s01.y;
 
 
 
-		float3 k11 = (pixf.x + 0.25) * Tw - Tu;
-		float3 l11 = (pixf.y + 0.25) * Tw - Tv;
+		float3 k11 = (pixf.x + 0.5) * Tw - Tu;
+		float3 l11 = (pixf.y + 0.5) * Tw - Tv;
 		float3 p11 = cross(k11, l11);
 		float2 s11 = {p11.x / p11.z, p11.y / p11.z};
 		float rho11 = s11.x * s11.x + s11.y * s11.y;
@@ -344,9 +440,7 @@ renderCUDA(
 		// and its exponential falloff from mean.
 		// Avoid numerical instabilities (see paper appendix). 
 
-		// const float G = (G00 + G10 + G01 + G11 + G_c) / 5.0f;
-		// const float G = (G00 + G10 + G01 + G11 + 8 * G_c) / 12.0f;
-		const float G = (G00 + G10 + G01 + G11) / 4.0f;
+		const float G = (G00 + G10 + G01 + G11 + G_c) / 5.0f;
 
 		// const float G = exp(power);
 		const float alpha = min(0.99f, nor_o.w * G);
@@ -371,7 +465,7 @@ renderCUDA(
 		// pair).
 		float dL_dalpha = 0.0f;
 		
-
+		float3 dL_drgb = {0, 0, 0};
 		for (int ch = 0; ch < C; ch++)
 		{
 			const float c = colors[global_id * C + ch];
@@ -387,8 +481,10 @@ renderCUDA(
 			// Update the gradients w.r.t. color of the Gaussian. 
 			// Atomic, since this pixel is just one of potentially
 			// many that were affected by this Gaussian.
-			atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+			// atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+			((float*)&dL_drgb)[ch] = dchannel_dcolor * dL_dchannel;
 		}
+		tex2D(dL_dtex+index.x, index.y, index.z, s.x/TexRange, s.y/TexRange, dL_drgb);
 		
 
 		float dL_dz = 0.0f;
@@ -474,8 +570,8 @@ renderCUDA(
 		if (rho3d <= rho2d)
 		{
 			dL_ds = {
-				0.0f * dL_dG * -G_c * s.x + dL_dz * Tw.x,
-				0.0f * dL_dG * -G_c * s.y + dL_dz * Tw.y
+				0.2f * dL_dG * -G_c * s.x + dL_dz * Tw.x,
+				0.2f * dL_dG * -G_c * s.y + dL_dz * Tw.y
 			};
 			const float3 dz_dTw = {s.x, s.y, 1.0};
 			dsx_pz = dL_ds.x / p.z;
@@ -494,8 +590,8 @@ renderCUDA(
 		else
 		{
 			dL_ds = {
-				0.0f * dL_dG * -G_c * s.x,
-				0.0f * dL_dG * -G_c * s.y,
+				0.2f * dL_dG * -G_c * s.x,
+				0.2f * dL_dG * -G_c * s.y,
 			};
 			dsx_pz = dL_ds.x / p.z;
 			dsy_pz = dL_ds.y / p.z;
@@ -517,8 +613,8 @@ renderCUDA(
 
 		// G00
 		dL_ds = {
-			0.25f * dL_dG * -G00 * s00.x,
-			0.25f * dL_dG * -G00 * s00.y
+			0.2f * dL_dG * -G00 * s00.x,
+			0.2f * dL_dG * -G00 * s00.y
 		};
 		dsx_pz = dL_ds.x / p00.z;
 		dsy_pz = dL_ds.y / p00.z;
@@ -529,14 +625,14 @@ renderCUDA(
 		const float3 dL_dTu_00 = {-dL_dk.x, -dL_dk.y, -dL_dk.z};
 		const float3 dL_dTv_00 = {-dL_dl.x, -dL_dl.y, -dL_dl.z};
 		const float3 dL_dTw_00 = {
-			(pixf.x - 0.25) * dL_dk.x + (pixf.y - 0.25) * dL_dl.x, 
-			(pixf.x - 0.25) * dL_dk.y + (pixf.y - 0.25) * dL_dl.y, 
-			(pixf.x - 0.25) * dL_dk.z + (pixf.y - 0.25) * dL_dl.z};
+			(pixf.x - 0.5) * dL_dk.x + (pixf.y - 0.5) * dL_dl.x, 
+			(pixf.x - 0.5) * dL_dk.y + (pixf.y - 0.5) * dL_dl.y, 
+			(pixf.x - 0.5) * dL_dk.z + (pixf.y - 0.5) * dL_dl.z};
 		
 		// G10
 		dL_ds = {
-			0.25f * dL_dG * -G10 * s10.x,
-			0.25f * dL_dG * -G10 * s10.y
+			0.2f * dL_dG * -G10 * s10.x,
+			0.2f * dL_dG * -G10 * s10.y
 		};
 		dsx_pz = dL_ds.x / p10.z;
 		dsy_pz = dL_ds.y / p10.z;
@@ -547,14 +643,14 @@ renderCUDA(
 		const float3 dL_dTu_10 = {-dL_dk.x, -dL_dk.y, -dL_dk.z};
 		const float3 dL_dTv_10 = {-dL_dl.x, -dL_dl.y, -dL_dl.z};
 		const float3 dL_dTw_10 = {
-			(pixf.x + 0.25) * dL_dk.x + (pixf.y - 0.25) * dL_dl.x, 
-			(pixf.x + 0.25) * dL_dk.y + (pixf.y - 0.25) * dL_dl.y, 
-			(pixf.x + 0.25) * dL_dk.z + (pixf.y - 0.25) * dL_dl.z};
+			(pixf.x + 0.5) * dL_dk.x + (pixf.y - 0.5) * dL_dl.x, 
+			(pixf.x + 0.5) * dL_dk.y + (pixf.y - 0.5) * dL_dl.y, 
+			(pixf.x + 0.5) * dL_dk.z + (pixf.y - 0.5) * dL_dl.z};
 
 		// G01
 		dL_ds = {
-			0.25f * dL_dG * -G01 * s01.x,
-			0.25f * dL_dG * -G01 * s01.y
+			0.2f * dL_dG * -G01 * s01.x,
+			0.2f * dL_dG * -G01 * s01.y
 		};
 		dsx_pz = dL_ds.x / p01.z;
 		dsy_pz = dL_ds.y / p01.z;
@@ -565,14 +661,14 @@ renderCUDA(
 		const float3 dL_dTu_01 = {-dL_dk.x, -dL_dk.y, -dL_dk.z};
 		const float3 dL_dTv_01 = {-dL_dl.x, -dL_dl.y, -dL_dl.z};
 		const float3 dL_dTw_01 = {
-			(pixf.x - 0.25) * dL_dk.x + (pixf.y + 0.25) * dL_dl.x, 
-			(pixf.x - 0.25) * dL_dk.y + (pixf.y + 0.25) * dL_dl.y, 
-			(pixf.x - 0.25) * dL_dk.z + (pixf.y + 0.25) * dL_dl.z};
+			(pixf.x - 0.5) * dL_dk.x + (pixf.y + 0.5) * dL_dl.x, 
+			(pixf.x - 0.5) * dL_dk.y + (pixf.y + 0.5) * dL_dl.y, 
+			(pixf.x - 0.5) * dL_dk.z + (pixf.y + 0.5) * dL_dl.z};
 		
 		// G11
 		dL_ds = {
-			0.25f * dL_dG * -G11 * s11.x,
-			0.25f * dL_dG * -G11 * s11.y
+			0.2f * dL_dG * -G11 * s11.x,
+			0.2f * dL_dG * -G11 * s11.y
 		};
 		dsx_pz = dL_ds.x / p11.z;
 		dsy_pz = dL_ds.y / p11.z;
@@ -583,9 +679,9 @@ renderCUDA(
 		const float3 dL_dTu_11 = {-dL_dk.x, -dL_dk.y, -dL_dk.z};
 		const float3 dL_dTv_11 = {-dL_dl.x, -dL_dl.y, -dL_dl.z};
 		const float3 dL_dTw_11 = {
-			(pixf.x + 0.25) * dL_dk.x + (pixf.y + 0.25) * dL_dl.x, 
-			(pixf.x + 0.25) * dL_dk.y + (pixf.y + 0.25) * dL_dl.y, 
-			(pixf.x + 0.25) * dL_dk.z + (pixf.y + 0.25) * dL_dl.z};
+			(pixf.x + 0.5) * dL_dk.x + (pixf.y + 0.5) * dL_dl.x, 
+			(pixf.x + 0.5) * dL_dk.y + (pixf.y + 0.5) * dL_dl.y, 
+			(pixf.x + 0.5) * dL_dk.z + (pixf.y + 0.5) * dL_dl.z};
 		
 
 		dL_dTu.x += (dL_dTu_00.x + dL_dTu_10.x + dL_dTu_01.x + dL_dTu_11.x);
@@ -717,30 +813,30 @@ renderCUDA(
 			if (power > 0.0f)
 				continue;
 
-			float3 k00 = (pixf.x - 0.25) * Tw - Tu;
-			float3 l00 = (pixf.y - 0.25) * Tw - Tv;
+			float3 k00 = (pixf.x - 0.5) * Tw - Tu;
+			float3 l00 = (pixf.y - 0.5) * Tw - Tv;
 			float3 p00 = cross(k00, l00);
 			float2 s00 = {p00.x / p00.z, p00.y / p00.z};
 			float rho00 = s00.x * s00.x + s00.y * s00.y;
 
 
-			float3 k10 = (pixf.x + 0.25) * Tw - Tu;
-			float3 l10 = (pixf.y - 0.25) * Tw - Tv;
+			float3 k10 = (pixf.x + 0.5) * Tw - Tu;
+			float3 l10 = (pixf.y - 0.5) * Tw - Tv;
 			float3 p10 = cross(k10, l10);
 			float2 s10 = {p10.x / p10.z, p10.y / p10.z};
 			float rho10 = s10.x * s10.x + s10.y * s10.y;
 
 
-			float3 k01 = (pixf.x - 0.25) * Tw - Tu;
-			float3 l01 = (pixf.y + 0.25) * Tw - Tv;
+			float3 k01 = (pixf.x - 0.5) * Tw - Tu;
+			float3 l01 = (pixf.y + 0.5) * Tw - Tv;
 			float3 p01 = cross(k01, l01);
 			float2 s01 = {p01.x / p01.z, p01.y / p01.z};
 			float rho01 = s01.x * s01.x + s01.y * s01.y;
 
 
 
-			float3 k11 = (pixf.x + 0.25) * Tw - Tu;
-			float3 l11 = (pixf.y + 0.25) * Tw - Tv;
+			float3 k11 = (pixf.x + 0.5) * Tw - Tu;
+			float3 l11 = (pixf.y + 0.5) * Tw - Tv;
 			float3 p11 = cross(k11, l11);
 			float2 s11 = {p11.x / p11.z, p11.y / p11.z};
 			float rho11 = s11.x * s11.x + s11.y * s11.y;
@@ -757,9 +853,7 @@ renderCUDA(
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
 
-			// const float G = (G00 + G10 + G01 + G11 + G_c) / 5.0f;
-			// const float G = (G00 + G10 + G01 + G11 + 8 * G_c) / 12.0f;
-			const float G = (G00 + G10 + G01 + G11) / 4.0f;
+			const float G = (G00 + G10 + G01 + G11 + G_c) / 5.0f;
 
 			// const float G = exp(power);
 			float alpha = min(0.99f, opa * G);
@@ -1051,6 +1145,7 @@ void BACKWARD::render(
 	const float2* means2D,
 	const float4* normal_opacity,
 	const float* colors,
+	const int3* texture_index,
 	const float* transMats,
 	const float* depths,
 	const float* final_Ts,
@@ -1064,7 +1159,8 @@ void BACKWARD::render(
 	float3* dL_dmean2D,
 	float* dL_dnormal3D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	float3* dL_dtex)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -1076,6 +1172,7 @@ void BACKWARD::render(
 		normal_opacity,
 		transMats,
 		colors,
+		texture_index,
 		depths,
 		final_Ts,
 		n_contrib,
@@ -1088,6 +1185,7 @@ void BACKWARD::render(
 		dL_dmean2D,
 		dL_dnormal3D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+		dL_dtex
 		);
 }

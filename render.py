@@ -31,6 +31,7 @@ if __name__ == "__main__":
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
     parser.add_argument("--iteration", default=-1, type=int)
+    parser.add_argument("--checkpoint", default="latest", type=str)
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--skip_mesh", action="store_true")
@@ -48,7 +49,7 @@ if __name__ == "__main__":
 
     dataset, iteration, pipe = model.extract(args), args.iteration, pipeline.extract(args)
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+    scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, checkpoint=args.checkpoint)
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     

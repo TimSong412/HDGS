@@ -34,12 +34,15 @@
 // #define FAR_PLANE 100.0
 #define DETACH_WEIGHT 1
 
-#define SORT_WINDOW 24
+#define SORT_WINDOW 24 // a40: gs  l40: gs2d for tex
+#define BILINEAR 1
 
 __device__ const float near_n = 0.2;
 __device__ const float far_n = 100.0;
 __device__ const float FilterSize = 0.707106; // sqrt(2) / 2
 __device__ const float FilterInvSquare = 2.0f;
+
+__device__ const float TexRange = 4.5f;
 
 // Spherical harmonics coefficients
 __device__ const float SH_C0 = 0.28209479177387814f;
@@ -176,6 +179,8 @@ __forceinline__ __device__ float2 operator*(float f, float2 a){return make_float
 __forceinline__ __device__ float3 operator-(float3 a, float3 b){return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);}
 
 __forceinline__ __device__ float2 operator-(float2 a, float2 b){return make_float2(a.x - b.x, a.y - b.y);}
+
+__forceinline__ __device__ float3 operator+(float3 a, float3 b){return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);}
 
 __forceinline__ __device__ float sumf3(float3 a){return a.x + a.y + a.z;}
 

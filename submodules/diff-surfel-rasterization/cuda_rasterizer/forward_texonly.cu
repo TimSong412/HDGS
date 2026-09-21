@@ -13,10 +13,72 @@
 #include "auxiliary.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include "tex.h"
 namespace cg = cooperative_groups;
 
+__device__ float3 tex2D(const float3* tex, int width, int height, float u, float v) {
+	// u, v are in [-1, 1]
+	u = (u + 1.0f) * 0.5f;
+	v = (v + 1.0f) * 0.5f;
+	// if (u < 0 || u > 1 || v < 0 || v > 1) printf("u, v: %f, %f, W, H: %d, %d\n", u, v, width, height); // TODO: may out bound
+	int x = min(max(int(u * (width-1)), 0), width - 1);
+	int y = min(max(int(v * (height-1)), 0), height - 1);
+	return tex[y * width + x];
+}
 
+// Forward method for converting the input spherical harmonics
+// coefficients of each Gaussian to a simple RGB color.
+__device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
+{
+	// The implementation is loosely based on code for 
+	// "Differentiable Point-Based Radiance Fields for 
+	// Efficient View Synthesis" by Zhang et al. (2022)
+	glm::vec3 pos = means[idx];
+	glm::vec3 dir = pos - campos;
+	dir = dir / glm::length(dir);
+
+	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;
+	glm::vec3 result = SH_C0 * sh[0];
+
+	if (deg > 0)
+	{
+		float x = dir.x;
+		float y = dir.y;
+		float z = dir.z;
+		result = result - SH_C1 * y * sh[1] + SH_C1 * z * sh[2] - SH_C1 * x * sh[3];
+
+		if (deg > 1)
+		{
+			float xx = x * x, yy = y * y, zz = z * z;
+			float xy = x * y, yz = y * z, xz = x * z;
+			result = result +
+				SH_C2[0] * xy * sh[4] +
+				SH_C2[1] * yz * sh[5] +
+				SH_C2[2] * (2.0f * zz - xx - yy) * sh[6] +
+				SH_C2[3] * xz * sh[7] +
+				SH_C2[4] * (xx - yy) * sh[8];
+
+			if (deg > 2)
+			{
+				result = result +
+					SH_C3[0] * y * (3.0f * xx - yy) * sh[9] +
+					SH_C3[1] * xy * z * sh[10] +
+					SH_C3[2] * y * (4.0f * zz - xx - yy) * sh[11] +
+					SH_C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * sh[12] +
+					SH_C3[4] * x * (4.0f * zz - xx - yy) * sh[13] +
+					SH_C3[5] * z * (xx - yy) * sh[14] +
+					SH_C3[6] * x * (xx - 3.0f * yy) * sh[15];
+			}
+		}
+	}
+	result += 0.5f;
+
+	// RGB colors are clamped to positive values. If values are
+	// clamped, we need to keep track of this for the backward pass.
+	clamped[3 * idx + 0] = (result.x < 0);
+	clamped[3 * idx + 1] = (result.y < 0);
+	clamped[3 * idx + 2] = (result.z < 0);
+	return glm::max(result, 0.0f);
+}
 
 // Compute a 2D-to-2D mapping matrix from a tangent plane into a image plane
 // given a 2D gaussian parameters.
@@ -184,12 +246,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		return;
 
 	// Compute colors 
-	// if (colors_precomp == nullptr) {
-	// 	glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
-	// 	rgb[idx * C + 0] = result.x;
-	// 	rgb[idx * C + 1] = result.y;
-	// 	rgb[idx * C + 2] = result.z;
-	// }
+	if (colors_precomp == nullptr) {
+		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
+		rgb[idx * C + 0] = result.x;
+		rgb[idx * C + 1] = result.y;
+		rgb[idx * C + 2] = result.z;
+	}
 
 	depths[idx] = p_view.z;
 	radii[idx] = (int)radius;
@@ -206,24 +268,17 @@ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H, int deg, int M,
+	int W, int H,
 	float focal_x, float focal_y,
 	const float2* __restrict__ points_xy_image,
-	const float* __restrict__ shs,
+	const float* __restrict__ features,
 	const float3* __restrict__ texture_buffer, // (T, 3), RGB
 	const int3* __restrict__ texture_index,  // (P, 3), start, W, H (x, y)
-	const float* __restrict__ orig_points,
-	const glm::vec2* __restrict__ scales,
-	const glm::vec4* __restrict__ rotations,
-	const glm::vec3* __restrict__ cam_pos,
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
-	float3* __restrict__ final_color,
-	float3* __restrict__ final_normal,
-	float* __restrict__ final_depth,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	float* __restrict__ out_others)
@@ -242,13 +297,6 @@ renderCUDA(
 	// Done threads can help with fetching, but don't rasterize
 	bool done = !inside;
 
-	// int XX = 386;
-	// int YY = 126;
-	// if (pix.x == XX && pix.y == YY)
-	// {
-	// 	printf("block: %d, %d, thread: %d, %d\n", block.group_index().x, block.group_index().y, block.thread_index().x, block.thread_index().y);
-	// }
-
 	// Load start/end range of IDs to process in bit sorted list.
 	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
@@ -261,31 +309,13 @@ renderCUDA(
 	__shared__ float3 collected_Tu[BLOCK_SIZE];
 	__shared__ float3 collected_Tv[BLOCK_SIZE];
 	__shared__ float3 collected_Tw[BLOCK_SIZE];
+	__shared__ int3 collected_index[BLOCK_SIZE];
 
 	// Initialize helper variables
 	float T = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
-
-	__shared__ float sorted_alpha[SORT_WINDOW*BLOCK_SIZE];
-	__shared__ float sorted_depth[SORT_WINDOW*BLOCK_SIZE];
-	__shared__ int sorted_id[SORT_WINDOW*BLOCK_SIZE];
-	__shared__ float2 sorted_s[SORT_WINDOW*BLOCK_SIZE];
-	int sorted_num = 0;
-
-	if (inside)
-	{
-		for (int kid = 0; kid < SORT_WINDOW; kid++)
-		{
-			sorted_alpha[kid + block.thread_rank()*SORT_WINDOW] = 0;
-			sorted_depth[kid + block.thread_rank()*SORT_WINDOW] = FLT_MAX;
-			sorted_id[kid + block.thread_rank()*SORT_WINDOW] = -1;
-			sorted_s[kid + block.thread_rank()*SORT_WINDOW] = {0, 0};
-		}
-	}
-	
-	
 
 
 #if RENDER_AXUTILITY
@@ -300,103 +330,6 @@ renderCUDA(
 	float median_contributor = {-1};
 
 #endif
-	int XX = 367;
-	int YY = 230;
-
-	// if (pix.x == XX && pix.y == YY)
-	// {
-	// 	printf("range: %d, %d\n", range.x, range.y);
-	// 	printf("pointid: %d\n", point_list[621209]);
-	// }
-
-	auto blend_one = [&]() {
-		// pop a gaussian from the sorted list and blend it 
-		if (sorted_num == 0)
-			return;
-			--sorted_num;
-
-		const float alpha = sorted_alpha[block.thread_rank()*SORT_WINDOW];
-		const int global_id = sorted_id[block.thread_rank()*SORT_WINDOW];
-		const float depth = sorted_depth[block.thread_rank()*SORT_WINDOW];
-		const float2 s = sorted_s[block.thread_rank()*SORT_WINDOW];
-
-		glm::mat3 R = quat_to_rotmat(rotations[global_id]);
-		glm::mat3 S = scale_to_mat(scales[global_id], 1.0f);
-		glm::mat3 L = R * S;
-
-		float3 p_orig = ((float3*)orig_points)[global_id]; // center of gaussian in world space
-
-		// center of Gaussians in the camera coordinate
-		glm::mat3x3 splat2world = glm::mat3x3(
-			L[0], 
-			L[1],
-			glm::vec3(p_orig.x, p_orig.y, p_orig.z)
-		);
-
-		glm::vec3 UV1 = {s.x, s.y, 1.0f};
-
-		// glm matrices are column-major
-		// pos_world = splat2world * UV1
-		glm::vec3 pos = splat2world * UV1;
-
-
-			
-
-		const int3 index = texture_index[global_id];
-
-		float test_T = T * (1 - alpha);
-
-		
-
-		if (test_T < 0.0001f) {
-			done = true;
-			return;
-		}
-
-		float w = alpha * T;
-#if RENDER_AXUTILITY
-		// Render depth distortion map
-		// Efficient implementation of distortion loss, see 2DGS' paper appendix.
-		float A = 1-T;
-		float m = far_n / (far_n - near_n) * (1 - near_n / depth);
-		distortion += (m * m * A + M2 - 2 * m * M1) * w;
-		D  += depth * w;
-		M1 += m * w;
-		M2 += m * m * w;
-
-		if (T > 0.5f) {
-			median_depth = depth;
-			// median_weight = w;
-			median_contributor = contributor;
-		}
-		float normal[3] = {normal_opacity[global_id].x, normal_opacity[global_id].y, normal_opacity[global_id].z};
-		// Render normal map
-		for (int ch=0; ch<3; ch++) N[ch] += w * normal[ch];
-#endif
-		
-		const float3 color = tex2D(texture_buffer + index.x, index.y, index.z, s.x/TexRange, s.y/TexRange);
-		glm::vec3 SH_color = computeTexFromSH(global_id, deg, M, pos, *cam_pos, shs, color);
-		for (int ch = 0; ch < CHANNELS; ch++)
-			C[ch] += SH_color[ch] * w;
-			// C[ch] += ((float*)&color)[ch] * w;
-		
-		
-		// Eq. (3) from 3D Gaussian splatting paper.
-		
-		T = test_T;
-		last_contributor = global_id;
-
-		for (int kid = 1; kid < SORT_WINDOW; kid++)
-		{
-			sorted_alpha[kid+ block.thread_rank()*SORT_WINDOW-1] = sorted_alpha[kid + block.thread_rank()*SORT_WINDOW];
-			sorted_depth[kid+ block.thread_rank()*SORT_WINDOW-1] = sorted_depth[kid + block.thread_rank()*SORT_WINDOW];
-			sorted_id[kid+ block.thread_rank()*SORT_WINDOW-1] = sorted_id[kid + block.thread_rank()*SORT_WINDOW];
-			sorted_s[kid+ block.thread_rank()*SORT_WINDOW-1] = sorted_s[kid + block.thread_rank()*SORT_WINDOW];
-		}
-		sorted_depth[SORT_WINDOW-1+ block.thread_rank()*SORT_WINDOW] = FLT_MAX;
-
-
-	};
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -411,43 +344,19 @@ renderCUDA(
 		if (range.x + progress < range.y)
 		{
 			int coll_id = point_list[range.x + progress];
-			// if ((range.x + progress == 621209))
-			// {
-			// 	printf("blocki: %d\n", i);
-			// 	printf("coll_id: %d\n", coll_id);
-			// 	printf("pix: %d, %d\n", pix.x, pix.y);
-			// 	printf("XXYY: %d, %d\n", XX, YY);
-			// }
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_normal_opacity[block.thread_rank()] = normal_opacity[coll_id];
 			collected_Tu[block.thread_rank()] = {transMats[9 * coll_id+0], transMats[9 * coll_id+1], transMats[9 * coll_id+2]};
 			collected_Tv[block.thread_rank()] = {transMats[9 * coll_id+3], transMats[9 * coll_id+4], transMats[9 * coll_id+5]};
 			collected_Tw[block.thread_rank()] = {transMats[9 * coll_id+6], transMats[9 * coll_id+7], transMats[9 * coll_id+8]};
+			collected_index[block.thread_rank()] = texture_index[coll_id];
 		}
 		block.sync();
-
-		// if (pix.x == XX && pix.y == YY && (i == 2 || i == 3))
-		// {	
-		// 	printf("blocki: %d\n", i);
-		// 	for(int st = 0; st < BLOCK_SIZE; st++)
-		// 	{
-		// 		printf("id: %d\n", collected_id[st]);
-		// 	}
-		// }
 
 		// Iterate over current batch
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
 		{
-			if (sorted_num == SORT_WINDOW)
-			{
-				// printf("blend one");
-				blend_one();
-			}
-			
-			if (done)
-				break;
-			
 			// Keep track of current position in range
 			contributor++;
 
@@ -456,6 +365,8 @@ renderCUDA(
 			const float3 Tu = collected_Tu[j];
 			const float3 Tv = collected_Tv[j];
 			const float3 Tw = collected_Tw[j];
+			const int3 index = collected_index[j];
+
 			float3 k = pix.x * Tw - Tu;
 			float3 l = pix.y * Tw - Tv;
 			float3 p = cross(k, l);
@@ -477,46 +388,43 @@ renderCUDA(
 			if (power > 0.0f)
 				continue;
 
-			// k = (pixf.x - 0.5f) * Tw - Tu;
-			// l = (pixf.y - 0.5f) * Tw - Tv;
-			// p = cross(k, l);
-			// float2 s00 = {p.x / p.z, p.y / p.z};
-			// float rho00 = s00.x * s00.x + s00.y * s00.y;
+			k = (pixf.x - 0.5) * Tw - Tu;
+			l = (pixf.y - 0.5) * Tw - Tv;
+			p = cross(k, l);
+			float2 s00 = {p.x / p.z, p.y / p.z};
+			float rho00 = s00.x * s00.x + s00.y * s00.y;
 
-			// k = (pixf.x + 0.5f) * Tw - Tu;
-			// l = (pixf.y - 0.5f) * Tw - Tv;
-			// p = cross(k, l);
-			// float2 s10 = {p.x / p.z, p.y / p.z};
-			// float rho10 = s10.x * s10.x + s10.y * s10.y;
+			k = (pixf.x + 0.5) * Tw - Tu;
+			l = (pixf.y - 0.5) * Tw - Tv;
+			p = cross(k, l);
+			float2 s10 = {p.x / p.z, p.y / p.z};
+			float rho10 = s10.x * s10.x + s10.y * s10.y;
 
-			// k = (pixf.x - 0.5f) * Tw - Tu;
-			// l = (pixf.y + 0.5f) * Tw - Tv;
-			// p = cross(k, l);
-			// float2 s01 = {p.x / p.z, p.y / p.z};
-			// float rho01 = s01.x * s01.x + s01.y * s01.y;
+			k = (pixf.x - 0.5) * Tw - Tu;
+			l = (pixf.y + 0.5) * Tw - Tv;
+			p = cross(k, l);
+			float2 s01 = {p.x / p.z, p.y / p.z};
+			float rho01 = s01.x * s01.x + s01.y * s01.y;
 
-			// k = (pixf.x + 0.5f) * Tw - Tu;
-			// l = (pixf.y + 0.5f) * Tw - Tv;
-			// p = cross(k, l);
-			// float2 s11 = {p.x / p.z, p.y / p.z};
-			// float rho11 = s11.x * s11.x + s11.y * s11.y;
+			k = (pixf.x + 0.5) * Tw - Tu;
+			l = (pixf.y + 0.5) * Tw - Tv;
+			p = cross(k, l);
+			float2 s11 = {p.x / p.z, p.y / p.z};
+			float rho11 = s11.x * s11.x + s11.y * s11.y;
 
-			// float G00 = exp(-0.5f * rho00);
-			// float G10 = exp(-0.5f * rho10);
-			// float G01 = exp(-0.5f * rho01);
-			// float G11 = exp(-0.5f * rho11);
+			float G00 = exp(-0.5f * rho00);
+			float G10 = exp(-0.5f * rho10);
+			float G01 = exp(-0.5f * rho01);
+			float G11 = exp(-0.5f * rho11);
 			float G_c = exp(-0.5f * rho3d);
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
 
-			// float G = (G00 + G10 + G01 + G11 + G_c) / 5.0f;
-			float G = G_c;
+			float G = (G00 + G10 + G01 + G11 + G_c) / 5.0f;
 
 			float alpha = min(0.99f, opa * G);
-
-			
 
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
@@ -525,28 +433,53 @@ renderCUDA(
 			// float alpha = min(0.99f, opa * exp(power));
 			if (alpha < 1.0f / 255.0f)
 				continue;
-			int global_id = collected_id[j];
-			// sort the gaussian by depth
-			for (int kid = 0; kid < SORT_WINDOW; kid++)
+			float test_T = T * (1 - alpha);
+			if (test_T < 0.0001f)
 			{
-				if (depth < sorted_depth[kid + block.thread_rank()*SORT_WINDOW])
-				{
-					swap(depth, sorted_depth[kid + block.thread_rank()*SORT_WINDOW]);
-					swap(alpha, sorted_alpha[kid + block.thread_rank()*SORT_WINDOW]);
-					swap(global_id, sorted_id[kid + block.thread_rank()*SORT_WINDOW]);
-					swap(s, sorted_s[kid + block.thread_rank()*SORT_WINDOW]);
-				}
+				done = true;
+				continue;
 			}
-			sorted_num ++;
-		
-		}
-	}
 
-	if (!done)
-	{
-		// Blend remaining Gaussians
-		while (sorted_num > 0)
-			blend_one();
+			float w = alpha * T;
+#if RENDER_AXUTILITY
+			// Render depth distortion map
+			// Efficient implementation of distortion loss, see 2DGS' paper appendix.
+			float A = 1-T;
+			float m = far_n / (far_n - near_n) * (1 - near_n / depth);
+			distortion += (m * m * A + M2 - 2 * m * M1) * w;
+			D  += depth * w;
+			M1 += m * w;
+			M2 += m * m * w;
+
+			if (T > 0.5) {
+				median_depth = depth;
+				// median_weight = w;
+				median_contributor = contributor;
+			}
+			// Render normal map
+			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
+#endif
+			// Fetch color from texture buffer
+			if (index.x >= 0)
+			{
+				float3 color = tex2D(texture_buffer+index.x, index.y, index.z, s.x/TexRange, s.y/TexRange);
+				// Eq. (3) from 3D Gaussian splatting paper.
+				for (int ch = 0; ch < CHANNELS; ch++)
+					// C[ch] += (features[collected_id[j] * CHANNELS + ch] + ((float*)&color)[ch]*SH_C0) * w;
+					C[ch] += ((float*)&color)[ch] * w;
+			}
+			else
+			{
+				// printf("color: %f, %f, %f\n", features[collected_id[j] * CHANNELS + 0], features[collected_id[j] * CHANNELS + 1], features[collected_id[j] * CHANNELS + 2]);
+				for (int ch = 0; ch < CHANNELS; ch++)
+					C[ch] += features[collected_id[j] * CHANNELS + ch] * w;
+			}
+			T = test_T;
+
+			// Keep track of last range entry to update this
+			// pixel.
+			last_contributor = contributor;
+		}
 	}
 
 	// All threads that treat valid pixel write out their final
@@ -555,10 +488,8 @@ renderCUDA(
 	{
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
-		final_color[pix_id] = {C[0], C[1], C[2]};
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
-		
 
 #if RENDER_AXUTILITY
 		n_contrib[pix_id + H * W] = median_contributor;
@@ -570,16 +501,6 @@ renderCUDA(
 		out_others[pix_id + MIDDEPTH_OFFSET * H * W] = median_depth;
 		out_others[pix_id + DISTORTION_OFFSET * H * W] = distortion;
 		// out_others[pix_id + MEDIAN_WEIGHT_OFFSET * H * W] = median_weight;
-		final_normal[pix_id] = {N[0], N[1], N[2]};
-		final_depth[pix_id] = D;
-		int XX = 367;
-		int YY = 230;
-
-		// if (pix.x == XX && pix.y == YY) {
-		// 	printf("final_color: %f, %f, %f\n", final_color[pix_id].x, final_color[pix_id].y, final_color[pix_id].z);
-		// 	printf("final_normal: %f, %f, %f\n", final_normal[pix_id].x, final_normal[pix_id].y, final_normal[pix_id].z);
-		// 	printf("final_depth: %f\n", final_depth[pix_id]);
-		// }
 #endif
 	}
 }
@@ -588,24 +509,17 @@ void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H, int deg, int M,
+	int W, int H,
 	float focal_x, float focal_y,
 	const float2* means2D,
-	const float* shs,
+	const float* colors,
 	const float3* texture_buffer,
 	const int3* texture_index,
-	const float* orig_points,
-	const glm::vec2* scales,
-	const glm::vec4* rotations,
-	const glm::vec3* cam_pos,
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
-	float3* final_color,
-	float3* final_normal,
-	float* final_depth,
 	const float* bg_color,
 	float* out_color,
 	float* out_others)
@@ -613,24 +527,17 @@ void FORWARD::render(
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
 		point_list,
-		W, H, deg, M,
+		W, H,
 		focal_x, focal_y,
 		means2D,
-		shs,
+		colors,
 		texture_buffer,
 		texture_index,
-		orig_points,
-		scales,
-		rotations,
-		cam_pos,
 		transMats,
 		depths,
 		normal_opacity,
 		final_T,
 		n_contrib,
-		final_color,
-		final_normal,
-		final_depth,
 		bg_color,
 		out_color,
 		out_others);

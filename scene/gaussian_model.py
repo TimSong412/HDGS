@@ -59,6 +59,23 @@ class GaussianModel:
         self.setup_functions()
 
     def capture(self):
+        if hasattr(self, "texture_index"):
+            return (
+                self.active_sh_degree,
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                self.xyz_gradient_accum,
+                self.denom,
+                self.optimizer.state_dict(),
+                self.spatial_lr_scale,
+                self.texture_buffer,
+                self.texture_index
+            )
         return (
             self.active_sh_degree,
             self._xyz,
@@ -74,23 +91,55 @@ class GaussianModel:
             self.spatial_lr_scale,
         )
     
-    def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
-        self.training_setup(training_args)
-        self.xyz_gradient_accum = xyz_gradient_accum
-        self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+    def restore(self, model_args, training_args=None):
+        if len(model_args) == 14:
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            self.xyz_gradient_accum, 
+            self.denom,
+            opt_dict, 
+            self.spatial_lr_scale,
+            self.texture_buffer,
+            self.texture_index) = model_args
+        elif len(model_args) == 13:
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            self.xyz_gradient_accum, 
+            self.denom,
+            opt_dict, 
+            self.spatial_lr_scale,
+            self.texture_buffer,
+            self.texture_index) = model_args
+            self._features_dc = torch.zeros((self._features_rest.shape[0], 1, 3), device="cuda")
+        else:
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            self.spatial_lr_scale) = model_args
+            self.xyz_gradient_accum = xyz_gradient_accum
+            self.denom = denom
+        if training_args:
+            self.training_setup(training_args)
+            self.optimizer.load_state_dict(opt_dict)
 
     @property
     def get_scaling(self):
@@ -389,10 +438,9 @@ class GaussianModel:
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
-        
-        if self.get_xyz.shape[0] < 1.8e7:
-            self.densify_and_clone(grads, max_grad, extent)
-            self.densify_and_split(grads, max_grad, extent)
+
+        self.densify_and_clone(grads, max_grad, extent)
+        self.densify_and_split(grads, max_grad, extent)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:

@@ -13,10 +13,123 @@
 #include "auxiliary.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include "tex.h"
 namespace cg = cooperative_groups;
 
+#if BILINEAR
 
+__device__ float3 tex2D(const float3* tex, int width, int height, float u, float v) {
+	// u, v are in [-1, 1]
+	u = (u + 1.0f) * 0.5f;
+	v = (v + 1.0f) * 0.5f;
+	// if (u < 0 || u > 1 || v < 0 || v > 1) printf("u, v: %f, %f, W, H: %d, %d\n", u, v, width, height); // TODO: may out bound
+	const float x = u * (width - 1);
+	const float y = v * (height - 1);
+	const int x0 = min(max((int)x, 0), width - 1);
+	const int y0 = min(max((int)y, 0), height - 1);
+	const int x1 = min(max((int)x + 1, 0), width - 1);
+	const int y1 = min(max((int)y + 1, 0), height - 1);
+
+	if (x0 == x1 && y0 == y1) return tex[y0 * width + x0];
+	else if (x0 == x1)
+	{
+		const float t = y - y0;
+		const float3 c0 = tex[y0 * width + x0];
+		const float3 c1 = tex[y1 * width + x0];
+		return (1 - t) * c0 + t * c1;
+	}
+	else if (y0 == y1)
+	{
+		const float s = x - x0;
+		const float3 c0 = tex[y0 * width + x0];
+		const float3 c1 = tex[y0 * width + x1];
+		return (1 - s) * c0 + s * c1;
+	}
+	else
+	{
+		const float s0 = x - x0;
+		const float s1 = x1 - x;
+		const float t0 = y - y0;
+		const float t1 = y1 - y;
+		const float3 c00 = tex[y0 * width + x0];
+		const float3 c01 = tex[y0 * width + x1];
+		const float3 c10 = tex[y1 * width + x0];
+		const float3 c11 = tex[y1 * width + x1];
+
+		return s1*t1*c00 + s0*t1*c01 + s1*t0*c10 + s0*t0*c11;
+	}
+	
+	
+	
+}
+
+#else
+
+__device__ float3 tex2D(const float3* tex, int width, int height, float u, float v) {
+	// u, v are in [-1, 1]
+	u = (u + 1.0f) * 0.5f;
+	v = (v + 1.0f) * 0.5f;
+	// if (u < 0 || u > 1 || v < 0 || v > 1) printf("u, v: %f, %f, W, H: %d, %d\n", u, v, width, height); // TODO: may out bound
+	int x = min(max(int(u * (width-1)), 0), width - 1);
+	int y = min(max(int(v * (height-1)), 0), height - 1);
+	return tex[y * width + x];
+}
+
+#endif
+
+// Forward method for converting the input spherical harmonics
+// coefficients of each Gaussian to a simple RGB color.
+__device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
+{
+	// The implementation is loosely based on code for 
+	// "Differentiable Point-Based Radiance Fields for 
+	// Efficient View Synthesis" by Zhang et al. (2022)
+	glm::vec3 pos = means[idx];
+	glm::vec3 dir = pos - campos;
+	dir = dir / glm::length(dir);
+
+	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;
+	glm::vec3 result = SH_C0 * sh[0];
+
+	if (deg > 0)
+	{
+		float x = dir.x;
+		float y = dir.y;
+		float z = dir.z;
+		result = result - SH_C1 * y * sh[1] + SH_C1 * z * sh[2] - SH_C1 * x * sh[3];
+
+		if (deg > 1)
+		{
+			float xx = x * x, yy = y * y, zz = z * z;
+			float xy = x * y, yz = y * z, xz = x * z;
+			result = result +
+				SH_C2[0] * xy * sh[4] +
+				SH_C2[1] * yz * sh[5] +
+				SH_C2[2] * (2.0f * zz - xx - yy) * sh[6] +
+				SH_C2[3] * xz * sh[7] +
+				SH_C2[4] * (xx - yy) * sh[8];
+
+			if (deg > 2)
+			{
+				result = result +
+					SH_C3[0] * y * (3.0f * xx - yy) * sh[9] +
+					SH_C3[1] * xy * z * sh[10] +
+					SH_C3[2] * y * (4.0f * zz - xx - yy) * sh[11] +
+					SH_C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * sh[12] +
+					SH_C3[4] * x * (4.0f * zz - xx - yy) * sh[13] +
+					SH_C3[5] * z * (xx - yy) * sh[14] +
+					SH_C3[6] * x * (xx - 3.0f * yy) * sh[15];
+			}
+		}
+	}
+	result += 0.5f;
+
+	// RGB colors are clamped to positive values. If values are
+	// clamped, we need to keep track of this for the backward pass.
+	clamped[3 * idx + 0] = (result.x < 0);
+	clamped[3 * idx + 1] = (result.y < 0);
+	clamped[3 * idx + 2] = (result.z < 0);
+	return glm::max(result, 0.0f);
+}
 
 // Compute a 2D-to-2D mapping matrix from a tangent plane into a image plane
 // given a 2D gaussian parameters.
@@ -184,12 +297,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		return;
 
 	// Compute colors 
-	// if (colors_precomp == nullptr) {
-	// 	glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
-	// 	rgb[idx * C + 0] = result.x;
-	// 	rgb[idx * C + 1] = result.y;
-	// 	rgb[idx * C + 2] = result.z;
-	// }
+	if (colors_precomp == nullptr) {
+		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
+		rgb[idx * C + 0] = result.x;
+		rgb[idx * C + 1] = result.y;
+		rgb[idx * C + 2] = result.z;
+	}
 
 	depths[idx] = p_view.z;
 	radii[idx] = (int)radius;
@@ -206,16 +319,12 @@ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H, int deg, int M,
+	int W, int H,
 	float focal_x, float focal_y,
 	const float2* __restrict__ points_xy_image,
-	const float* __restrict__ shs,
+	const float* __restrict__ features,
 	const float3* __restrict__ texture_buffer, // (T, 3), RGB
 	const int3* __restrict__ texture_index,  // (P, 3), start, W, H (x, y)
-	const float* __restrict__ orig_points,
-	const glm::vec2* __restrict__ scales,
-	const glm::vec4* __restrict__ rotations,
-	const glm::vec3* __restrict__ cam_pos,
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
@@ -319,28 +428,7 @@ renderCUDA(
 		const int global_id = sorted_id[block.thread_rank()*SORT_WINDOW];
 		const float depth = sorted_depth[block.thread_rank()*SORT_WINDOW];
 		const float2 s = sorted_s[block.thread_rank()*SORT_WINDOW];
-
-		glm::mat3 R = quat_to_rotmat(rotations[global_id]);
-		glm::mat3 S = scale_to_mat(scales[global_id], 1.0f);
-		glm::mat3 L = R * S;
-
-		float3 p_orig = ((float3*)orig_points)[global_id]; // center of gaussian in world space
-
-		// center of Gaussians in the camera coordinate
-		glm::mat3x3 splat2world = glm::mat3x3(
-			L[0], 
-			L[1],
-			glm::vec3(p_orig.x, p_orig.y, p_orig.z)
-		);
-
-		glm::vec3 UV1 = {s.x, s.y, 1.0f};
-
-		// glm matrices are column-major
-		// pos_world = splat2world * UV1
-		glm::vec3 pos = splat2world * UV1;
-
-
-			
+		
 
 		const int3 index = texture_index[global_id];
 
@@ -364,7 +452,7 @@ renderCUDA(
 		M1 += m * w;
 		M2 += m * m * w;
 
-		if (T > 0.5f) {
+		if (T > 0.5) {
 			median_depth = depth;
 			// median_weight = w;
 			median_contributor = contributor;
@@ -373,14 +461,17 @@ renderCUDA(
 		// Render normal map
 		for (int ch=0; ch<3; ch++) N[ch] += w * normal[ch];
 #endif
-		
-		const float3 color = tex2D(texture_buffer + index.x, index.y, index.z, s.x/TexRange, s.y/TexRange);
-		glm::vec3 SH_color = computeTexFromSH(global_id, deg, M, pos, *cam_pos, shs, color);
-		for (int ch = 0; ch < CHANNELS; ch++)
-			C[ch] += SH_color[ch] * w;
-			// C[ch] += ((float*)&color)[ch] * w;
-		
-		
+		if (index.x >= 0)
+		{
+			const float3 color = tex2D(texture_buffer + index.x, index.y, index.z, s.x/TexRange, s.y/TexRange);
+			for (int ch = 0; ch < CHANNELS; ch++)
+				C[ch] += ((float*)&color)[ch] * w;
+		}
+		else
+		{
+			for (int ch = 0; ch < CHANNELS; ch++)
+				C[ch] += features[global_id * CHANNELS + ch] * w;
+		}
 		// Eq. (3) from 3D Gaussian splatting paper.
 		
 		T = test_T;
@@ -477,42 +568,41 @@ renderCUDA(
 			if (power > 0.0f)
 				continue;
 
-			// k = (pixf.x - 0.5f) * Tw - Tu;
-			// l = (pixf.y - 0.5f) * Tw - Tv;
-			// p = cross(k, l);
-			// float2 s00 = {p.x / p.z, p.y / p.z};
-			// float rho00 = s00.x * s00.x + s00.y * s00.y;
+			k = (pixf.x - 0.5) * Tw - Tu;
+			l = (pixf.y - 0.5) * Tw - Tv;
+			p = cross(k, l);
+			float2 s00 = {p.x / p.z, p.y / p.z};
+			float rho00 = s00.x * s00.x + s00.y * s00.y;
 
-			// k = (pixf.x + 0.5f) * Tw - Tu;
-			// l = (pixf.y - 0.5f) * Tw - Tv;
-			// p = cross(k, l);
-			// float2 s10 = {p.x / p.z, p.y / p.z};
-			// float rho10 = s10.x * s10.x + s10.y * s10.y;
+			k = (pixf.x + 0.5) * Tw - Tu;
+			l = (pixf.y - 0.5) * Tw - Tv;
+			p = cross(k, l);
+			float2 s10 = {p.x / p.z, p.y / p.z};
+			float rho10 = s10.x * s10.x + s10.y * s10.y;
 
-			// k = (pixf.x - 0.5f) * Tw - Tu;
-			// l = (pixf.y + 0.5f) * Tw - Tv;
-			// p = cross(k, l);
-			// float2 s01 = {p.x / p.z, p.y / p.z};
-			// float rho01 = s01.x * s01.x + s01.y * s01.y;
+			k = (pixf.x - 0.5) * Tw - Tu;
+			l = (pixf.y + 0.5) * Tw - Tv;
+			p = cross(k, l);
+			float2 s01 = {p.x / p.z, p.y / p.z};
+			float rho01 = s01.x * s01.x + s01.y * s01.y;
 
-			// k = (pixf.x + 0.5f) * Tw - Tu;
-			// l = (pixf.y + 0.5f) * Tw - Tv;
-			// p = cross(k, l);
-			// float2 s11 = {p.x / p.z, p.y / p.z};
-			// float rho11 = s11.x * s11.x + s11.y * s11.y;
+			k = (pixf.x + 0.5) * Tw - Tu;
+			l = (pixf.y + 0.5) * Tw - Tv;
+			p = cross(k, l);
+			float2 s11 = {p.x / p.z, p.y / p.z};
+			float rho11 = s11.x * s11.x + s11.y * s11.y;
 
-			// float G00 = exp(-0.5f * rho00);
-			// float G10 = exp(-0.5f * rho10);
-			// float G01 = exp(-0.5f * rho01);
-			// float G11 = exp(-0.5f * rho11);
+			float G00 = exp(-0.5f * rho00);
+			float G10 = exp(-0.5f * rho10);
+			float G01 = exp(-0.5f * rho01);
+			float G11 = exp(-0.5f * rho11);
 			float G_c = exp(-0.5f * rho3d);
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
 
-			// float G = (G00 + G10 + G01 + G11 + G_c) / 5.0f;
-			float G = G_c;
+			float G = (G00 + G10 + G01 + G11 + G_c) / 5.0f;
 
 			float alpha = min(0.99f, opa * G);
 
@@ -588,16 +678,12 @@ void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H, int deg, int M,
+	int W, int H,
 	float focal_x, float focal_y,
 	const float2* means2D,
-	const float* shs,
+	const float* colors,
 	const float3* texture_buffer,
 	const int3* texture_index,
-	const float* orig_points,
-	const glm::vec2* scales,
-	const glm::vec4* rotations,
-	const glm::vec3* cam_pos,
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
@@ -613,16 +699,12 @@ void FORWARD::render(
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
 		point_list,
-		W, H, deg, M,
+		W, H,
 		focal_x, focal_y,
 		means2D,
-		shs,
+		colors,
 		texture_buffer,
 		texture_index,
-		orig_points,
-		scales,
-		rotations,
-		cam_pos,
 		transMats,
 		depths,
 		normal_opacity,

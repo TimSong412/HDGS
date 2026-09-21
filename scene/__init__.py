@@ -17,12 +17,13 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+import torch
 
 class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], checkpoint=None):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -30,12 +31,14 @@ class Scene:
         self.loaded_iter = None
         self.gaussians = gaussians
 
-        if load_iteration:
+        if load_iteration and (checkpoint is None):
             if load_iteration == -1:
                 self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
             else:
                 self.loaded_iter = load_iteration
             print("Loading trained model at iteration {}".format(self.loaded_iter))
+        else:
+            self.loaded_iter = None
 
         self.train_cameras = {}
         self.test_cameras = {}
@@ -79,6 +82,9 @@ class Scene:
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
+        elif checkpoint:
+            (model_params, first_iter) = torch.load(checkpoint)
+            gaussians.restore(model_params)
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 

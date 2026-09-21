@@ -23,6 +23,7 @@ from utils.image_utils import psnr, render_net_image
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import time
+from texture_manager import init_texture
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -41,6 +42,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    gs_start_W_H, texture_buffer = init_texture(gaussians, 700)
+
+    texture_opt = torch.optim.Adam([texture_buffer.texture_buffer], lr=1e-3)
+    texture_scheduler = torch.optim.lr_scheduler.StepLR(texture_opt, step_size=5000, gamma=0.1)
+
+    gaussians._xyz.requires_grad = False
+    gaussians._features_dc.requires_grad = False
+    gaussians._features_rest.requires_grad = False
+    gaussians._scaling.requires_grad = False
+    gaussians._rotation.requires_grad = False
+
+    gaussians._opacity.requires_grad = False
+
+
+    gaussians.texture_index = gs_start_W_H
+    gaussians.texture_buffer = texture_buffer.texture_buffer
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -69,8 +87,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-
-        print("camera: ", viewpoint_cam.image_name)
         
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -80,7 +96,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         
         # regularization
-        lambda_normal = opt.lambda_normal if iteration > 3000 else 0.0
+        lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
         lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
 
         rend_dist = render_pkg["rend_dist"]
@@ -93,20 +109,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # loss
         total_loss = loss + dist_loss + normal_loss
 
-        
         iter_end.record()
         iter_end.synchronize()
         print("forward time: ", iter_start.elapsed_time(iter_end))
         
         total_loss.backward()
-        
-        
+
         iter_end.record()
         iter_end.synchronize()
         print("full time: ", iter_start.elapsed_time(iter_end))
 
-        if iteration %10 == 0:
-            exit()
+        iter_end.record()
 
         with torch.no_grad():
             # Progress bar
@@ -140,21 +153,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
             # Densification
-            if iteration < opt.densify_until_iter:
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            # if iteration < opt.densify_until_iter:
+            #     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+            #     gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold)
+            #     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+            #         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+            #         gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold)
                 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+            #     if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+            #         gaussians.reset_opacity()
 
             # Optimizer step
-            if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
+            # if iteration < opt.iterations:
+            # gaussians.optimizer.step()
+            # gaussians.optimizer.zero_grad(set_to_none = True)
+            texture_opt.step()
+            texture_opt.zero_grad(set_to_none = True)
+            texture_scheduler.step()
+
+            if iteration % 10 == 0:
+                exit()
+
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -190,8 +210,8 @@ def prepare_output_and_logger(args):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-        unique_str = "debug"
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+        unique_str = time.strftime("%m%d-%H%M%S") 
+        args.model_path = os.path.join("./output/", unique_str+"_texture")
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
@@ -276,10 +296,10 @@ if __name__ == "__main__":
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[2000*i for i in range(1, 20)])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[12000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[2000*i for i in range(1, 40)])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[12000, 30000])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[35000, 42000, 50000, 60000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

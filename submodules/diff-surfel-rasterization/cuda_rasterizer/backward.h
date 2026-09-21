@@ -21,16 +21,22 @@
 namespace BACKWARD
 {
 	void render(
-		const dim3 grid, dim3 block,
+		const dim3 grid, const dim3 block,
 		const uint2* ranges,
 		const uint32_t* point_list,
-		int W, int H,
+		int W, int H, int deg, int M,
 		float focal_x, float focal_y,
 		const float* bg_color,
 		const float2* means2D,
 		const float4* normal_opacity,
 		const float* transMats,
-		const float* colors,
+		const float* shs,
+		const float3* texture_buffer,
+		const int3* texture_index,
+		const float* orig_points,
+		const glm::vec2* scales,
+		const glm::vec4* rotations,
+		const glm::vec3* cam_pos,
 		const float* depths,
 		const float* final_Ts,
 		const uint32_t* n_contrib,
@@ -43,7 +49,9 @@ namespace BACKWARD
 		float3* dL_dmean2D,
 		float* dL_dnormal3D,
 		float* dL_dopacity,
-		float* dL_dcolors);
+		float* dL_dcolors,
+		float3* dL_dtex,
+		float* dL_dshs);
 
 	void preprocess(
 		int P, int D, int M,
